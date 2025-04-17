@@ -1722,20 +1722,22 @@ arena_choose_huge(tsd_t *tsd) {
 		if (huge_arena == NULL) {
 			return NULL;
 		}
-		/*
-		 * Purge eagerly for huge allocations, because: 1) number of
-		 * huge allocations is usually small, which means ticker based
-		 * decay is not reliable; and 2) less immediate reuse is
-		 * expected for huge allocations.
-		 */
-		if (arena_dirty_decay_ms_default_get() > 0) {
-			arena_decay_ms_set(tsd_tsdn(tsd), huge_arena,
-			    extent_state_dirty, 0);
-		}
-		if (arena_muzzy_decay_ms_default_get() > 0) {
-			arena_decay_ms_set(tsd_tsdn(tsd), huge_arena,
-			    extent_state_muzzy, 0);
-		}
+        if (!background_thread_enabled()) {
+            /*
+            * Purge eagerly for huge allocations, because: 1) number of
+            * huge allocations is usually small, which means ticker based
+            * decay is not reliable; and 2) less immediate reuse is
+            * expected for huge allocations.
+            */
+            if (arena_dirty_decay_ms_default_get() > 0) {
+                arena_decay_ms_set(tsd_tsdn(tsd), huge_arena,
+                    extent_state_dirty, 0);
+            }
+            if (arena_muzzy_decay_ms_default_get() > 0) {
+                arena_decay_ms_set(tsd_tsdn(tsd), huge_arena,
+                    extent_state_muzzy, 0);
+            }
+        }
 	}
 
 	return huge_arena;
