@@ -152,6 +152,67 @@ pac_alloc_retained_batched_size(size_t size) {
 	                                         : batched_size;
 }
 
+static void pac_decay_to_limit(tsdn_t *tsdn, pac_t *pac, decay_t *decay,
+    pac_decay_stats_t *decay_stats, ecache_t *ecache, bool fully_decay,
+    size_t npages_limit, size_t npages_decay_max);
+
+static atomic_p_t pac_purge_before_grow_hook = ATOMIC_INIT(NULL);
+
+pac_purge_before_grow_hook_t
+pac_purge_before_grow_hook_get(void) {
+	return (pac_purge_before_grow_hook_t)atomic_load_p(
+	    &pac_purge_before_grow_hook, ATOMIC_ACQUIRE);
+}
+
+void
+pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook) {
+	atomic_store_p(
+	    &pac_purge_before_grow_hook, (void *)hook, ATOMIC_RELEASE);
+}
+
+/* Purges up to npages_max dirty pages of pac, oldest first. */
+static size_t
+pac_purge_dirty(tsdn_t *tsdn, pac_t *pac, size_t npages_max) {
+	decay_t *decay = &pac->decay_dirty;
+	ecache_t *ecache = &pac->ecache_dirty;
+	malloc_mutex_lock(tsdn, &decay->mtx);
+	size_t before = ecache_npages_get(ecache);
+	size_t npurge = before < npages_max ? before : npages_max;
+	pac_decay_to_limit(tsdn, pac, decay, &pac->stats->decay_dirty, ecache,
+	    /* fully_decay */ true, before - npurge, npurge);
+	size_t after = ecache_npages_get(ecache);
+	malloc_mutex_unlock(tsdn, &decay->mtx);
+	size_t npurged = before > after ? before - after : 0;
+	return npurged < npages_max ? npurged : npages_max;
+}
+
+/*
+ * Lets the hook purge dirty pages before size bytes become resident: first
+ * from pac, whose dirty pages could not serve this allocation, then from the
+ * other arenas.
+ */
+static void
+pac_purge_before_grow(tsdn_t *tsdn, pac_t *pac, size_t size) {
+	pac_purge_before_grow_hook_t hook = pac_purge_before_grow_hook_get();
+	if (hook == NULL) {
+		return;
+	}
+	size_t dirty_bytes = eset_dirty_npages_global_get() << LG_PAGE;
+	size_t npurge = PAGE_CEILING(hook(size, dirty_bytes)) >> LG_PAGE;
+	if (npurge == 0) {
+		return;
+	}
+	npurge -= pac_purge_dirty(tsdn, pac, npurge);
+	unsigned narenas = narenas_total_get();
+	for (unsigned i = 0; i < narenas && npurge > 0; i++) {
+		arena_t *arena = arena_get(tsdn, i, false);
+		if (arena != NULL && &arena->pa_shard.pac != pac) {
+			npurge -= pac_purge_dirty(
+			    tsdn, &arena->pa_shard.pac, npurge);
+		}
+	}
+}
+
 static edata_t *
 pac_alloc_real(tsdn_t *tsdn, pac_t *pac, ehooks_t *ehooks, size_t size,
     size_t alignment, bool zero, bool guarded) {
@@ -196,6 +257,10 @@ pac_alloc_real(tsdn_t *tsdn, pac_t *pac, ehooks_t *ehooks, size_t size,
 	if (edata == NULL && pac_may_have_muzzy(pac)) {
 		edata = ecache_alloc(tsdn, pac, ehooks, &pac->ecache_muzzy,
 		    NULL, size, alignment, zero, guarded);
+	}
+
+	if (edata == NULL) {
+		pac_purge_before_grow(tsdn, pac, size);
 	}
 
 	/*
@@ -357,6 +422,7 @@ pac_expand(tsdn_t *tsdn, pac_t *pac, edata_t *edata, size_t old_size,
 			    PAGE, zero, /* guarded */ false);
 		}
 		if (trail == NULL) {
+			pac_purge_before_grow(tsdn, pac, expand_amount);
 			trail = ecache_alloc_grow(tsdn, pac, ehooks,
 			    &pac->ecache_retained, edata, expand_amount,
 			    PAGE, zero, /* guarded */ false);

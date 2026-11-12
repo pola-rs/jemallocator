@@ -305,6 +305,18 @@ pac_decay_immediately(pac_t *pac) {
 
 void pac_destroy(tsdn_t *tsdn, pac_t *pac);
 
+/*
+ * Called before an allocation takes pages that are not resident, with the size
+ * of the allocation and the bytes of dirty pages in all arenas. Returns the
+ * bytes of dirty pages to purge first. It runs inside malloc, so it must not
+ * allocate.
+ */
+typedef size_t (*pac_purge_before_grow_hook_t)(
+    size_t size, size_t dirty_bytes);
+
+pac_purge_before_grow_hook_t pac_purge_before_grow_hook_get(void);
+void pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook);
+
 void pac_sec_flush(tsdn_t *tsdn, pac_t *pac);
 
 #endif /* JEMALLOC_INTERNAL_PAC_H */

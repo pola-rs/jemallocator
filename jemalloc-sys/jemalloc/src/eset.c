@@ -30,6 +30,13 @@ eset_init(eset_t *eset, extent_state_t state) {
 	eset->state = state;
 }
 
+static atomic_zu_t eset_dirty_npages_global = ATOMIC_INIT(0);
+
+size_t
+eset_dirty_npages_global_get(void) {
+	return atomic_load_zu(&eset_dirty_npages_global, ATOMIC_RELAXED);
+}
+
 size_t
 eset_npages_get(const eset_t *eset) {
 	return atomic_load_zu(&eset->npages, ATOMIC_RELAXED);
@@ -110,6 +117,10 @@ eset_insert(eset_t *eset, edata_t *edata) {
 	size_t cur_eset_npages = atomic_load_zu(&eset->npages, ATOMIC_RELAXED);
 	atomic_store_zu(
 	    &eset->npages, cur_eset_npages + npages, ATOMIC_RELAXED);
+	if (eset->state == extent_state_dirty) {
+		atomic_fetch_add_zu(
+		    &eset_dirty_npages_global, npages, ATOMIC_RELAXED);
+	}
 }
 
 void
@@ -158,6 +169,10 @@ eset_remove(eset_t *eset, edata_t *edata) {
 	assert(cur_extents_npages >= npages);
 	atomic_store_zu(&eset->npages, cur_extents_npages - (size >> LG_PAGE),
 	    ATOMIC_RELAXED);
+	if (eset->state == extent_state_dirty) {
+		atomic_fetch_sub_zu(
+		    &eset_dirty_npages_global, npages, ATOMIC_RELAXED);
+	}
 }
 
 static edata_t *

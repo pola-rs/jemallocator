@@ -396,6 +396,7 @@ CTL_PROTO(stats_pinned)
 CTL_PROTO(stats_zero_reallocs)
 CTL_PROTO(approximate_stats_active)
 CTL_PROTO(experimental_hooks_prof_backtrace)
+CTL_PROTO(experimental_hooks_purge_before_grow)
 CTL_PROTO(experimental_hooks_prof_dump)
 CTL_PROTO(experimental_hooks_prof_sample)
 CTL_PROTO(experimental_hooks_prof_sample_free)
@@ -934,6 +935,7 @@ static const ctl_named_node_t experimental_hooks_node[] = {
     {NAME("prof_sample"), CTL(experimental_hooks_prof_sample)},
     {NAME("prof_sample_free"), CTL(experimental_hooks_prof_sample_free)},
     {NAME("thread_event"), CTL(experimental_hooks_thread_event)},
+    {NAME("purge_before_grow"), CTL(experimental_hooks_purge_before_grow)},
 };
 
 static const ctl_named_node_t experimental_utilization_node[] = {
@@ -3525,6 +3527,25 @@ prof_log_stop_ctl(tsd_t *tsd, const size_t *mib, size_t miblen, void *oldp,
 	}
 
 	return 0;
+}
+
+static int
+experimental_hooks_purge_before_grow_ctl(tsd_t *tsd, const size_t *mib,
+    size_t miblen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+	int ret = 0;
+	if (oldp != NULL) {
+		pac_purge_before_grow_hook_t old_hook =
+		    pac_purge_before_grow_hook_get();
+		ret = ctl_read(oldp, oldlenp, &old_hook, sizeof(old_hook));
+	}
+	if (ret == 0 && newp != NULL) {
+		pac_purge_before_grow_hook_t new_hook = NULL;
+		ret = ctl_write(&new_hook, sizeof(new_hook), newp, newlen);
+		if (ret == 0) {
+			pac_purge_before_grow_hook_set(new_hook);
+		}
+	}
+	return ret;
 }
 
 static int

@@ -60,6 +60,9 @@ struct eset_s {
 
 void eset_init(eset_t *eset, extent_state_t state);
 
+/* The number of pages in the dirty esets of all arenas. */
+size_t eset_dirty_npages_global_get(void);
+
 size_t eset_npages_get(const eset_t *eset);
 /* Get the number of extents in the given page size index. */
 size_t eset_nextents_get(const eset_t *eset, pszind_t ind);
