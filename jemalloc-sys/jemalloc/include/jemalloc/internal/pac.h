@@ -2,12 +2,14 @@
 #define JEMALLOC_INTERNAL_PAC_H
 
 #include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/atomic.h"
 #include "jemalloc/internal/decay.h"
 #include "jemalloc/internal/ecache.h"
 #include "jemalloc/internal/edata.h"
 #include "jemalloc/internal/edata_cache.h"
 #include "jemalloc/internal/exp_grow.h"
 #include "jemalloc/internal/lockedint.h"
+#include "jemalloc/internal/sc.h"
 #include "jemalloc/internal/sec.h"
 #include "jemalloc/internal/tsd_types.h"
 #include "san_bump.h"
@@ -324,13 +326,11 @@ void pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook);
 /*
  * A moving reallocation calls begin with the usable size of the old allocation
  * before it allocates the replacement, and end with the result of begin once
- * the old allocation is freed or the replacement failed. The usable size can be
- * a bit larger than the size the caller asked for. Old allocations are only
- * counted while a purge-before-grow hook is set, and only from
- * PAC_RALLOC_MOVE_MIN_BYTES, so less than that per thread is missed. The
- * bytes are counted per shard of threads, and the hook gets the sum.
+ * the old allocation is freed or the replacement failed. Old allocations are
+ * only counted while a purge-before-grow hook is set, and only large ones, so
+ * less than SC_LARGE_MINCLASS per thread is missed. The bytes are counted per
+ * shard of threads, and the hook gets the sum.
  */
-#define PAC_RALLOC_MOVE_MIN_BYTES ((size_t)1 << 20)
 #define PAC_RALLOC_MOVE_NSHARDS 64
 
 typedef struct pac_ralloc_move_s pac_ralloc_move_t;
@@ -339,8 +339,23 @@ struct pac_ralloc_move_s {
 	size_t       bytes;
 };
 
-pac_ralloc_move_t pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize);
-void              pac_ralloc_move_end(pac_ralloc_move_t move);
+pac_ralloc_move_t pac_ralloc_move_begin_large(tsdn_t *tsdn, size_t old_usize);
+
+static inline pac_ralloc_move_t
+pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize) {
+	if (old_usize < SC_LARGE_MINCLASS) {
+		pac_ralloc_move_t move = {NULL, 0};
+		return move;
+	}
+	return pac_ralloc_move_begin_large(tsdn, old_usize);
+}
+
+static inline void
+pac_ralloc_move_end(pac_ralloc_move_t move) {
+	if (move.bytes != 0) {
+		atomic_fetch_sub_zu(move.shard_bytes, move.bytes, ATOMIC_RELAXED);
+	}
+}
 
 void pac_sec_flush(tsdn_t *tsdn, pac_t *pac);
 

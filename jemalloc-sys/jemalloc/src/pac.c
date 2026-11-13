@@ -178,10 +178,9 @@ struct pac_ralloc_move_shard_s {
 static pac_ralloc_move_shard_t pac_ralloc_move_shards[PAC_RALLOC_MOVE_NSHARDS];
 
 pac_ralloc_move_t
-pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize) {
+pac_ralloc_move_begin_large(tsdn_t *tsdn, size_t old_usize) {
 	pac_ralloc_move_t move = {NULL, 0};
-	if (old_usize < PAC_RALLOC_MOVE_MIN_BYTES
-	    || pac_purge_before_grow_hook_get() == NULL) {
+	if (pac_purge_before_grow_hook_get() == NULL) {
 		return move;
 	}
 	/* Threads are spread over arenas, so this spreads them over shards. */
@@ -196,13 +195,6 @@ pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize) {
 	move.bytes = old_usize;
 	atomic_fetch_add_zu(move.shard_bytes, old_usize, ATOMIC_RELAXED);
 	return move;
-}
-
-void
-pac_ralloc_move_end(pac_ralloc_move_t move) {
-	if (move.bytes != 0) {
-		atomic_fetch_sub_zu(move.shard_bytes, move.bytes, ATOMIC_RELAXED);
-	}
 }
 
 /*
@@ -449,6 +441,7 @@ pac_expand(tsdn_t *tsdn, pac_t *pac, edata_t *edata, size_t old_size,
 		return true;
 	}
 	edata_t *trail = NULL;
+	bool     purge_after_expand = false;
 	if (edata_pinned_get(edata)) {
 		trail = ecache_alloc(tsdn, pac, ehooks,
 		    &pac->ecache_pinned, edata, expand_amount,
@@ -473,7 +466,18 @@ pac_expand(tsdn_t *tsdn, pac_t *pac, edata_t *edata, size_t old_size,
 			    PAGE, zero, /* guarded */ false);
 		}
 		if (trail == NULL) {
-			pac_purge_before_grow(tsdn, pac, expand_amount);
+			/*
+			 * The default hooks only touch the new pages to zero
+			 * them, so without zeroing the purge can wait until the
+			 * expansion is done. If it fails, the reallocation
+			 * moves instead and may reuse the dirty pages that the
+			 * purge would have dropped. Other hooks may touch the
+			 * pages while taking them, so purge first for them.
+			 */
+			purge_after_expand = ehooks_are_default(ehooks) && !zero;
+			if (!purge_after_expand) {
+				pac_purge_before_grow(tsdn, pac, expand_amount);
+			}
 			trail = ecache_alloc_grow(tsdn, pac, ehooks,
 			    &pac->ecache_retained, edata, expand_amount,
 			    PAGE, zero, /* guarded */ false);
@@ -501,6 +505,9 @@ pac_expand(tsdn_t *tsdn, pac_t *pac, edata_t *edata, size_t old_size,
 	if (config_stats && mapped_add > 0) {
 		atomic_fetch_add_zu(
 		    &pac->stats->pac_mapped, mapped_add, ATOMIC_RELAXED);
+	}
+	if (purge_after_expand) {
+		pac_purge_before_grow(tsdn, pac, expand_amount);
 	}
 	return false;
 }

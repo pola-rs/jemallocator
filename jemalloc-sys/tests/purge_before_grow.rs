@@ -23,6 +23,7 @@ const HOOK_NAME: &str = "experimental.hooks.purge_before_grow_v2";
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 static LAST_MOVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static MAX_MOVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static MIN_MOVE_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 static BLOCKED_MOVERS: AtomicUsize = AtomicUsize::new(0);
 static RELEASE_MOVERS: AtomicBool = AtomicBool::new(false);
 static FAIL_EXTENT_ALLOC: AtomicBool = AtomicBool::new(false);
@@ -42,8 +43,10 @@ extern "C" fn record_hook(_size: size_t, _dirty_bytes: size_t, move_bytes: size_
         return 0;
     }
     CALLS.fetch_add(1, Ordering::SeqCst);
+    LAST_HOOK_SEQUENCE.store(SEQUENCE.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
     LAST_MOVE_BYTES.store(move_bytes, Ordering::SeqCst);
     MAX_MOVE_BYTES.fetch_max(move_bytes, Ordering::SeqCst);
+    MIN_MOVE_BYTES.fetch_min(move_bytes, Ordering::SeqCst);
     0
 }
 
@@ -51,6 +54,7 @@ fn reset_records() {
     CALLS.store(0, Ordering::SeqCst);
     LAST_MOVE_BYTES.store(0, Ordering::SeqCst);
     MAX_MOVE_BYTES.store(0, Ordering::SeqCst);
+    MIN_MOVE_BYTES.store(usize::MAX, Ordering::SeqCst);
 }
 
 /// The hook is global, so the tests run one at a time.
@@ -146,32 +150,69 @@ unsafe extern "C" fn failing_alloc(
 /// allocations of `no_merge` arenas can't grow in place.
 fn new_arena(no_merge: bool) -> c_uint {
     let arena = if no_merge {
-        let default_hooks: *mut extent_hooks_t = read_ctl("arena.0.extent_hooks");
-        let mut hooks = unsafe { *default_hooks };
+        let mut hooks = default_hooks();
         DEFAULT_ALLOC.store(hooks.alloc.unwrap() as usize, Ordering::SeqCst);
         hooks.alloc = Some(failing_alloc);
         hooks.merge = None;
-        let hooks: *mut extent_hooks_t = Box::leak(Box::new(hooks));
-        let mut arena: c_uint = 0;
-        let mut len = size_of::<c_uint>();
-        let mut hooks_ptr = hooks;
-        let ret = unsafe {
-            mallctl(
-                b"arenas.create\0".as_ptr().cast(),
-                &mut arena as *mut c_uint as *mut c_void,
-                &mut len,
-                &mut hooks_ptr as *mut *mut extent_hooks_t as *mut c_void,
-                size_of::<*mut extent_hooks_t>(),
-            )
-        };
-        assert_eq!(ret, 0);
-        arena
+        create_arena(hooks)
     } else {
         read_ctl("arenas.create")
     };
     write_ctl(&arena_ctl(arena, "dirty_decay_ms"), 0isize);
     write_ctl(&arena_ctl(arena, "muzzy_decay_ms"), 0isize);
     arena
+}
+
+fn default_hooks() -> extent_hooks_t {
+    let default_hooks: *mut extent_hooks_t = read_ctl("arena.0.extent_hooks");
+    unsafe { *default_hooks }
+}
+
+fn create_arena(hooks: extent_hooks_t) -> c_uint {
+    let mut hooks_ptr: *mut extent_hooks_t = Box::leak(Box::new(hooks));
+    let mut arena: c_uint = 0;
+    let mut len = size_of::<c_uint>();
+    let ret = unsafe {
+        mallctl(
+            b"arenas.create\0".as_ptr().cast(),
+            &mut arena as *mut c_uint as *mut c_void,
+            &mut len,
+            &mut hooks_ptr as *mut *mut extent_hooks_t as *mut c_void,
+            size_of::<*mut extent_hooks_t>(),
+        )
+    };
+    assert_eq!(ret, 0);
+    arena
+}
+
+/// Orders the calls of the purge hook and the commit hook.
+static SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+static LAST_HOOK_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+static FIRST_COMMIT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn recording_commit(
+    _hooks: *mut extent_hooks_t,
+    _addr: *mut c_void,
+    _size: size_t,
+    _offset: size_t,
+    _length: size_t,
+    _arena_ind: c_uint,
+) -> bool {
+    let seq = SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let _ = FIRST_COMMIT_SEQUENCE.compare_exchange(0, seq, Ordering::SeqCst, Ordering::SeqCst);
+    false
+}
+
+/// Reports success without decommitting, so the pages stay usable.
+unsafe extern "C" fn fake_decommit(
+    _hooks: *mut extent_hooks_t,
+    _addr: *mut c_void,
+    _size: size_t,
+    _offset: size_t,
+    _length: size_t,
+    _arena_ind: c_uint,
+) -> bool {
+    false
 }
 
 fn flags(arena: c_uint) -> i32 {
@@ -245,14 +286,15 @@ fn moved_growth_counts_old_allocation() {
     let arena = new_arena(true);
     let probe_arena = new_arena(false);
 
+    let large_min: usize = read_ctl("arenas.lextent.0.size");
+
     let seen = moved_growth(arena, 3 * MIB, 8 * MIB);
     assert!(seen >= 3 * MIB);
     // Shrinking can also move, e.g. out of the large size classes.
-    let seen = moved_growth(arena, 2 * MIB, 1 << 10);
-    assert!(seen >= 2 * MIB);
-    // Old allocations under 1 MiB are not counted.
-    assert_eq!(moved_growth(arena, 1 << 10, MIB), 0);
-    assert_eq!(moved_growth(arena, 512 << 10, 4 * MIB), 0);
+    let seen = moved_growth(arena, large_min, 1 << 10);
+    assert_eq!(seen, large_min);
+    // Small allocations are not counted.
+    assert_eq!(moved_growth(arena, large_min / 2, 4 * MIB), 0);
 
     assert_eq!(current_move_bytes(probe_arena), 0);
 }
@@ -297,6 +339,56 @@ fn in_place_growth_is_not_counted() {
         dallocx(p, flags(arena));
     }
     assert_eq!(current_move_bytes(probe_arena), 0);
+}
+
+#[test]
+fn failed_expansion_does_not_call_hook() {
+    let _guard = setup();
+    let arena = new_arena(false);
+    unsafe {
+        let p = mallocx(2 * MIB, flags(arena));
+        assert!(!p.is_null());
+        // Takes the pages right behind `p`, so `p` can't grow in place.
+        let neighbor = mallocx(2 * MIB, flags(arena));
+        assert!(!neighbor.is_null());
+        let old_usize = sallocx(p, 0);
+        purge(arena);
+        reset_records();
+        let new = rallocx(p, 4 * MIB, flags(arena));
+        assert!(!new.is_null());
+        assert_ne!(new, p, "the reallocation did not move");
+        // Only the replacement asks to purge, with the old allocation counted.
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(MIN_MOVE_BYTES.load(Ordering::SeqCst), old_usize);
+        dallocx(new, flags(arena));
+        dallocx(neighbor, flags(arena));
+    }
+}
+
+#[test]
+fn purge_comes_before_committing_growth() {
+    let _guard = setup();
+    // Purged pages of this arena are decommitted, so growing into them commits.
+    let mut hooks = default_hooks();
+    hooks.commit = Some(recording_commit);
+    hooks.decommit = Some(fake_decommit);
+    let arena = create_arena(hooks);
+    write_ctl(&arena_ctl(arena, "dirty_decay_ms"), 0isize);
+    write_ctl(&arena_ctl(arena, "muzzy_decay_ms"), 0isize);
+    unsafe {
+        let p = mallocx(8 * MIB, flags(arena));
+        assert!(!p.is_null());
+        assert_eq!(rallocx(p, 2 * MIB, flags(arena)), p);
+        purge(arena);
+        reset_records();
+        FIRST_COMMIT_SEQUENCE.store(0, Ordering::SeqCst);
+        assert_eq!(rallocx(p, 6 * MIB, flags(arena)), p);
+        let commit = FIRST_COMMIT_SEQUENCE.load(Ordering::SeqCst);
+        assert_ne!(commit, 0, "growing did not commit");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert!(LAST_HOOK_SEQUENCE.load(Ordering::SeqCst) < commit);
+        dallocx(p, flags(arena));
+    }
 }
 
 #[test]
