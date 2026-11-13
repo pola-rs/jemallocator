@@ -18,6 +18,8 @@ const MIB: usize = 1 << 20;
 
 type Hook = extern "C" fn(size_t, size_t, size_t) -> size_t;
 
+const HOOK_NAME: &str = "experimental.hooks.purge_before_grow_v2";
+
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 static LAST_MOVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static MAX_MOVE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -55,8 +57,8 @@ fn reset_records() {
 fn setup() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    write_ctl("experimental.hooks.purge_before_grow", record_hook as Hook);
-    let installed: usize = read_ctl("experimental.hooks.purge_before_grow");
+    write_ctl(HOOK_NAME, record_hook as Hook);
+    let installed: usize = read_ctl(HOOK_NAME);
     assert_eq!(installed, record_hook as Hook as usize);
     reset_records();
     guard
@@ -333,7 +335,9 @@ fn concurrent_moves_are_all_counted() {
             .map(|i| {
                 let start = &start;
                 s.spawn(move || unsafe {
+                    // Bound to different arenas, the movers count in different shards.
                     let arena = new_arena(true);
+                    write_ctl("thread.arena", arena);
                     let old_size = (i + 1) * MIB;
                     let old = mallocx(old_size, flags(arena));
                     assert!(!old.is_null());
@@ -364,4 +368,22 @@ fn concurrent_moves_are_all_counted() {
     });
     assert!(old_usizes >= 10 * MIB);
     assert_eq!(current_move_bytes(probe_arena), 0);
+}
+
+#[test]
+fn unversioned_hook_name_is_rejected() {
+    let _guard = setup();
+    // A two-argument hook from before the third argument must not install.
+    let name = CString::new("experimental.hooks.purge_before_grow").unwrap();
+    let mut hook = record_hook as Hook;
+    let ret = unsafe {
+        mallctl(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut hook as *mut Hook as *mut c_void,
+            size_of::<Hook>(),
+        )
+    };
+    assert_eq!(ret, libc::ENOENT);
 }

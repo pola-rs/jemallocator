@@ -101,11 +101,12 @@ malloc_dispatch_ralloc(tsdn_t *tsdn, arena_t *arena, void *ptr, size_t oldsize,
 	 * size and oldsize are different enough that we need to move the
 	 * object.  In that case, fall back to allocating new space and copying.
 	 */
-	size_t move_bytes = pac_ralloc_move_begin(oldsize);
-	void  *ret = malloc_dispatch_ralloc_move_helper(
+	pac_ralloc_move_t move = pac_ralloc_move_begin(tsdn, oldsize);
+
+	void *ret = malloc_dispatch_ralloc_move_helper(
 	    tsdn, arena, usize, alignment, zero, slab, tcache);
 	if (ret == NULL) {
-		pac_ralloc_move_end(move_bytes);
+		pac_ralloc_move_end(move);
 		return NULL;
 	}
 
@@ -115,6 +116,6 @@ malloc_dispatch_ralloc(tsdn_t *tsdn, arena_t *arena, void *ptr, size_t oldsize,
 	size_t copysize = (usize < oldsize) ? usize : oldsize;
 	memcpy(ret, ptr, copysize);
 	isdalloct(tsdn, ptr, oldsize, tcache, NULL, true);
-	pac_ralloc_move_end(move_bytes);
+	pac_ralloc_move_end(move);
 	return ret;
 }

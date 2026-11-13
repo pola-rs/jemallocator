@@ -311,6 +311,9 @@ void pac_destroy(tsdn_t *tsdn, pac_t *pac);
  * old allocations that moving reallocations still hold while they allocate
  * their replacement (see pac_ralloc_move_begin). Returns the bytes of dirty
  * pages to purge first. It runs inside malloc, so it must not allocate.
+ *
+ * Set through experimental.hooks.purge_before_grow_v2. The name changes when
+ * the signature does.
  */
 typedef size_t (*pac_purge_before_grow_hook_t)(
     size_t size, size_t dirty_bytes, size_t ralloc_move_bytes);
@@ -324,12 +327,20 @@ void pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook);
  * the old allocation is freed or the replacement failed. The usable size can be
  * a bit larger than the size the caller asked for. Old allocations are only
  * counted while a purge-before-grow hook is set, and only from
- * PAC_RALLOC_MOVE_MIN_BYTES: the shared counter slows down concurrent small
- * moves, and leaving them out misses less than that per thread.
+ * PAC_RALLOC_MOVE_MIN_BYTES, so less than that per thread is missed. The
+ * bytes are counted per shard of threads, and the hook gets the sum.
  */
 #define PAC_RALLOC_MOVE_MIN_BYTES ((size_t)1 << 20)
-size_t pac_ralloc_move_begin(size_t old_usize);
-void   pac_ralloc_move_end(size_t counted_bytes);
+#define PAC_RALLOC_MOVE_NSHARDS 64
+
+typedef struct pac_ralloc_move_s pac_ralloc_move_t;
+struct pac_ralloc_move_s {
+	atomic_zu_t *shard_bytes;
+	size_t       bytes;
+};
+
+pac_ralloc_move_t pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize);
+void              pac_ralloc_move_end(pac_ralloc_move_t move);
 
 void pac_sec_flush(tsdn_t *tsdn, pac_t *pac);
 

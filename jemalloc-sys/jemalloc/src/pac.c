@@ -170,24 +170,53 @@ pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook) {
 	    &pac_purge_before_grow_hook, (void *)hook, ATOMIC_RELEASE);
 }
 
-static atomic_zu_t pac_ralloc_move_bytes = ATOMIC_INIT(0);
+typedef struct pac_ralloc_move_shard_s pac_ralloc_move_shard_t;
+struct pac_ralloc_move_shard_s {
+	JEMALLOC_ALIGNED(CACHELINE) atomic_zu_t bytes;
+};
 
-size_t
-pac_ralloc_move_begin(size_t old_usize) {
+static pac_ralloc_move_shard_t pac_ralloc_move_shards[PAC_RALLOC_MOVE_NSHARDS];
+
+pac_ralloc_move_t
+pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize) {
+	pac_ralloc_move_t move = {NULL, 0};
 	if (old_usize < PAC_RALLOC_MOVE_MIN_BYTES
 	    || pac_purge_before_grow_hook_get() == NULL) {
-		return 0;
+		return move;
 	}
-	atomic_fetch_add_zu(&pac_ralloc_move_bytes, old_usize, ATOMIC_RELAXED);
-	return old_usize;
+	/* Threads are spread over arenas, so this spreads them over shards. */
+	unsigned shard = 0;
+	if (!tsdn_null(tsdn)) {
+		arena_t *arena = tsd_arena_get(tsdn_tsd(tsdn));
+		if (arena != NULL) {
+			shard = arena_ind_get(arena) % PAC_RALLOC_MOVE_NSHARDS;
+		}
+	}
+	move.shard_bytes = &pac_ralloc_move_shards[shard].bytes;
+	move.bytes = old_usize;
+	atomic_fetch_add_zu(move.shard_bytes, old_usize, ATOMIC_RELAXED);
+	return move;
 }
 
 void
-pac_ralloc_move_end(size_t counted_bytes) {
-	if (counted_bytes != 0) {
-		atomic_fetch_sub_zu(
-		    &pac_ralloc_move_bytes, counted_bytes, ATOMIC_RELAXED);
+pac_ralloc_move_end(pac_ralloc_move_t move) {
+	if (move.bytes != 0) {
+		atomic_fetch_sub_zu(move.shard_bytes, move.bytes, ATOMIC_RELAXED);
 	}
+}
+
+/*
+ * Each shard is only decremented after it was incremented by the same amount,
+ * so a sum of shards read one at a time never underflows.
+ */
+static size_t
+pac_ralloc_move_bytes_get(void) {
+	size_t bytes = 0;
+	for (unsigned i = 0; i < PAC_RALLOC_MOVE_NSHARDS; i++) {
+		bytes += atomic_load_zu(
+		    &pac_ralloc_move_shards[i].bytes, ATOMIC_RELAXED);
+	}
+	return bytes;
 }
 
 /* Purges up to npages_max dirty pages of pac, oldest first. */
@@ -218,8 +247,7 @@ pac_purge_before_grow(tsdn_t *tsdn, pac_t *pac, size_t size) {
 		return;
 	}
 	size_t dirty_bytes = eset_dirty_npages_global_get() << LG_PAGE;
-	size_t ralloc_move_bytes = atomic_load_zu(
-	    &pac_ralloc_move_bytes, ATOMIC_RELAXED);
+	size_t ralloc_move_bytes = pac_ralloc_move_bytes_get();
 	size_t npurge = PAGE_CEILING(hook(size, dirty_bytes, ralloc_move_bytes))
 	    >> LG_PAGE;
 	if (npurge == 0) {
