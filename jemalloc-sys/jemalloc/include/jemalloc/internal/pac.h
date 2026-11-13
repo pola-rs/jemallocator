@@ -2,12 +2,14 @@
 #define JEMALLOC_INTERNAL_PAC_H
 
 #include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/atomic.h"
 #include "jemalloc/internal/decay.h"
 #include "jemalloc/internal/ecache.h"
 #include "jemalloc/internal/edata.h"
 #include "jemalloc/internal/edata_cache.h"
 #include "jemalloc/internal/exp_grow.h"
 #include "jemalloc/internal/lockedint.h"
+#include "jemalloc/internal/sc.h"
 #include "jemalloc/internal/sec.h"
 #include "jemalloc/internal/tsd_types.h"
 #include "san_bump.h"
@@ -307,15 +309,53 @@ void pac_destroy(tsdn_t *tsdn, pac_t *pac);
 
 /*
  * Called before an allocation takes pages that are not resident, with the size
- * of the allocation and the bytes of dirty pages in all arenas. Returns the
- * bytes of dirty pages to purge first. It runs inside malloc, so it must not
- * allocate.
+ * of the allocation, the bytes of dirty pages in all arenas, and the bytes of
+ * old allocations that moving reallocations still hold while they allocate
+ * their replacement (see pac_ralloc_move_begin). Returns the bytes of dirty
+ * pages to purge first. It runs inside malloc, so it must not allocate.
+ *
+ * Set through experimental.hooks.purge_before_grow_v2. The name changes when
+ * the signature does.
  */
 typedef size_t (*pac_purge_before_grow_hook_t)(
-    size_t size, size_t dirty_bytes);
+    size_t size, size_t dirty_bytes, size_t ralloc_move_bytes);
 
 pac_purge_before_grow_hook_t pac_purge_before_grow_hook_get(void);
 void pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook);
+
+/*
+ * A moving reallocation calls begin with the usable size of the old allocation
+ * before it allocates the replacement, and end with the result of begin once
+ * the old allocation is freed or the replacement failed. Old allocations are
+ * only counted while a purge-before-grow hook is set, and only large ones, so
+ * less than SC_LARGE_MINCLASS per thread is missed. The bytes are counted per
+ * shard of threads, and the hook gets the sum.
+ */
+#define PAC_RALLOC_MOVE_NSHARDS 64
+
+typedef struct pac_ralloc_move_s pac_ralloc_move_t;
+struct pac_ralloc_move_s {
+	atomic_zu_t *shard_bytes;
+	size_t       bytes;
+};
+
+pac_ralloc_move_t pac_ralloc_move_begin_large(tsdn_t *tsdn, size_t old_usize);
+
+static inline pac_ralloc_move_t
+pac_ralloc_move_begin(tsdn_t *tsdn, size_t old_usize) {
+	if (old_usize < SC_LARGE_MINCLASS) {
+		pac_ralloc_move_t move = {NULL, 0};
+		return move;
+	}
+	return pac_ralloc_move_begin_large(tsdn, old_usize);
+}
+
+static inline void
+pac_ralloc_move_end(pac_ralloc_move_t move) {
+	if (move.bytes != 0) {
+		atomic_fetch_sub_zu(move.shard_bytes, move.bytes, ATOMIC_RELAXED);
+	}
+}
 
 void pac_sec_flush(tsdn_t *tsdn, pac_t *pac);
 
