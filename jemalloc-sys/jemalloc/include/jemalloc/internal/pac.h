@@ -307,15 +307,29 @@ void pac_destroy(tsdn_t *tsdn, pac_t *pac);
 
 /*
  * Called before an allocation takes pages that are not resident, with the size
- * of the allocation and the bytes of dirty pages in all arenas. Returns the
- * bytes of dirty pages to purge first. It runs inside malloc, so it must not
- * allocate.
+ * of the allocation, the bytes of dirty pages in all arenas, and the bytes of
+ * old allocations that moving reallocations still hold while they allocate
+ * their replacement (see pac_ralloc_move_begin). Returns the bytes of dirty
+ * pages to purge first. It runs inside malloc, so it must not allocate.
  */
 typedef size_t (*pac_purge_before_grow_hook_t)(
-    size_t size, size_t dirty_bytes);
+    size_t size, size_t dirty_bytes, size_t ralloc_move_bytes);
 
 pac_purge_before_grow_hook_t pac_purge_before_grow_hook_get(void);
 void pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook);
+
+/*
+ * A moving reallocation calls begin with the usable size of the old allocation
+ * before it allocates the replacement, and end with the result of begin once
+ * the old allocation is freed or the replacement failed. The usable size can be
+ * a bit larger than the size the caller asked for. Old allocations are only
+ * counted while a purge-before-grow hook is set, and only from
+ * PAC_RALLOC_MOVE_MIN_BYTES: the shared counter slows down concurrent small
+ * moves, and leaving them out misses less than that per thread.
+ */
+#define PAC_RALLOC_MOVE_MIN_BYTES ((size_t)1 << 20)
+size_t pac_ralloc_move_begin(size_t old_usize);
+void   pac_ralloc_move_end(size_t counted_bytes);
 
 void pac_sec_flush(tsdn_t *tsdn, pac_t *pac);
 

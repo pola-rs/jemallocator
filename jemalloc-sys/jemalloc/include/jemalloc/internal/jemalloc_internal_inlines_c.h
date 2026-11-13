@@ -186,9 +186,11 @@ iralloct_realign(tsdn_t *tsdn, void *ptr, size_t oldsize, size_t size,
 	if (unlikely(usize == 0 || usize > SC_LARGE_MAXCLASS)) {
 		return NULL;
 	}
+	size_t move_bytes = pac_ralloc_move_begin(oldsize);
 	p = ipalloct_explicit_slab(
 	    tsdn, usize, alignment, zero, slab, tcache, arena);
 	if (p == NULL) {
+		pac_ralloc_move_end(move_bytes);
 		return NULL;
 	}
 	/*
@@ -198,6 +200,7 @@ iralloct_realign(tsdn_t *tsdn, void *ptr, size_t oldsize, size_t size,
 	copysize = (size < oldsize) ? size : oldsize;
 	memcpy(p, ptr, copysize);
 	isdalloct(tsdn, ptr, oldsize, tcache, NULL, true);
+	pac_ralloc_move_end(move_bytes);
 	return p;
 }
 

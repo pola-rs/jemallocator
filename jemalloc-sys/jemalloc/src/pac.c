@@ -170,6 +170,26 @@ pac_purge_before_grow_hook_set(pac_purge_before_grow_hook_t hook) {
 	    &pac_purge_before_grow_hook, (void *)hook, ATOMIC_RELEASE);
 }
 
+static atomic_zu_t pac_ralloc_move_bytes = ATOMIC_INIT(0);
+
+size_t
+pac_ralloc_move_begin(size_t old_usize) {
+	if (old_usize < PAC_RALLOC_MOVE_MIN_BYTES
+	    || pac_purge_before_grow_hook_get() == NULL) {
+		return 0;
+	}
+	atomic_fetch_add_zu(&pac_ralloc_move_bytes, old_usize, ATOMIC_RELAXED);
+	return old_usize;
+}
+
+void
+pac_ralloc_move_end(size_t counted_bytes) {
+	if (counted_bytes != 0) {
+		atomic_fetch_sub_zu(
+		    &pac_ralloc_move_bytes, counted_bytes, ATOMIC_RELAXED);
+	}
+}
+
 /* Purges up to npages_max dirty pages of pac, oldest first. */
 static size_t
 pac_purge_dirty(tsdn_t *tsdn, pac_t *pac, size_t npages_max) {
@@ -198,7 +218,10 @@ pac_purge_before_grow(tsdn_t *tsdn, pac_t *pac, size_t size) {
 		return;
 	}
 	size_t dirty_bytes = eset_dirty_npages_global_get() << LG_PAGE;
-	size_t npurge = PAGE_CEILING(hook(size, dirty_bytes)) >> LG_PAGE;
+	size_t ralloc_move_bytes = atomic_load_zu(
+	    &pac_ralloc_move_bytes, ATOMIC_RELAXED);
+	size_t npurge = PAGE_CEILING(hook(size, dirty_bytes, ralloc_move_bytes))
+	    >> LG_PAGE;
 	if (npurge == 0) {
 		return;
 	}

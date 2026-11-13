@@ -207,15 +207,18 @@ large_ralloc(tsdn_t *tsdn, arena_t *arena, void *ptr, size_t usize,
 	 * different size class.  In that case, fall back to allocating new
 	 * space and copying.
 	 */
-	void *ret = large_ralloc_move_helper(
+	size_t move_bytes = pac_ralloc_move_begin(oldusize);
+	void  *ret = large_ralloc_move_helper(
 	    tsdn, arena, usize, alignment, zero);
 	if (ret == NULL) {
+		pac_ralloc_move_end(move_bytes);
 		return NULL;
 	}
 
 	size_t copysize = (usize < oldusize) ? usize : oldusize;
 	memcpy(ret, edata_addr_get(edata), copysize);
 	isdalloct(tsdn, edata_addr_get(edata), oldusize, tcache, NULL, true);
+	pac_ralloc_move_end(move_bytes);
 	return ret;
 }
 
